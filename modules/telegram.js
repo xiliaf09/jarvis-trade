@@ -1,5 +1,5 @@
 // ============================================================
-// JARVIS TRADE — Telegram Bot UI (Sigma-inspired flow)
+// JARVIS TRADE — Telegram Bot UI (Sigma-inspired)
 // ============================================================
 
 const TelegramBot = require('node-telegram-bot-api');
@@ -11,20 +11,19 @@ const price = require('./price');
 
 let bot = null;
 let _config = null;
-const _state = new Map(); // userId → { step, data } (conversation state for multi-step flows)
-const _processedMsgs = new Set(); // anti-duplicate
+const _state = new Map(); // userId → { step, data }
+const _processedMsgs = new Set();
+const _userPrefs = new Map(); // userId → { activeWalletId, slippageBps }
 
 function init(config) {
   _config = config;
   bot = new TelegramBot(config.telegramToken, {
     polling: { interval: 2000, autoStart: true, params: { timeout: 30 } },
   });
-
   bot.on('polling_error', (err) => {
     if (err.code === 'ETELEGRAM' && err.message.includes('409')) return;
     console.error('⚠️  Telegram polling error:', err.message);
   });
-
   _registerHandlers();
   console.log('📱 Telegram bot connected');
 }
@@ -37,53 +36,64 @@ function _isAuthorized(msg) {
   if (mid) {
     _processedMsgs.add(mid);
     if (_processedMsgs.size > 200) {
-      const oldest = _processedMsgs.values().next().value;
-      _processedMsgs.delete(oldest);
+      _processedMsgs.delete(_processedMsgs.values().next().value);
     }
   }
   return true;
 }
 
+function _getUserPrefs(userId) {
+  if (!_userPrefs.has(userId)) {
+    _userPrefs.set(userId, { activeWalletId: null, slippageBps: 100, presetIndex: null });
+  }
+  return _userPrefs.get(userId);
+}
+
+function _shortAddr(addr) {
+  return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+}
+
+function _fmtEth(wei) {
+  return parseFloat(ethers.formatEther(wei)).toFixed(4);
+}
+
+function _fmtUsd(n) {
+  if (n >= 1000) return '$' + (n / 1000).toFixed(1) + 'K';
+  if (n >= 1) return '$' + n.toFixed(2);
+  return '$' + n.toFixed(6);
+}
+
+// ════════════════════════════════════════════════════════════
+// HANDLERS
+// ════════════════════════════════════════════════════════════
+
 function _registerHandlers() {
-  // ── /start → Main menu ──
   bot.onText(/^\/start/, (msg) => {
     if (!_isAuthorized(msg)) return;
     _sendMainMenu(msg.chat.id, String(msg.from.id));
   });
 
-  // ── /wallet ──
-  bot.onText(/^\/wallet/, (msg) => {
+  bot.onText(/^\/wallets?$/, (msg) => {
     if (!_isAuthorized(msg)) return;
-    _sendWalletMenu(msg.chat.id, String(msg.from.id));
+    _sendWalletsMenu(msg.chat.id, String(msg.from.id));
   });
 
-  // ── /positions ──
-  bot.onText(/^\/positions/, async (msg) => {
+  bot.onText(/^\/positions/, (msg) => {
     if (!_isAuthorized(msg)) return;
-    await _sendPositions(msg.chat.id, String(msg.from.id));
+    _sendPositions(msg.chat.id, String(msg.from.id));
   });
 
-  // ── /stats ──
-  bot.onText(/^\/stats/, (msg) => {
+  bot.onText(/^\/settings/, (msg) => {
     if (!_isAuthorized(msg)) return;
-    const stats = positions.getStats(String(msg.from.id));
-    bot.sendMessage(msg.chat.id,
-      `📊 *Stats*\n\n` +
-      `Trades: ${stats.totalTrades} (${stats.buys} buys · ${stats.sells} sells)\n` +
-      `Win rate: ${stats.winRate.toFixed(1)}%\n` +
-      `Realized PnL: $${stats.realizedPnl.toFixed(2)}\n` +
-      `Open positions: ${stats.openPositions}`,
-      { parse_mode: 'Markdown' }
-    );
+    _sendSettingsMenu(msg.chat.id, String(msg.from.id));
   });
 
-  // ── Auto-detect contract addresses pasted in chat ──
+  // Auto-detect CA + stateful input handler
   bot.on('message', async (msg) => {
     if (!_isAuthorized(msg)) return;
     const text = (msg.text || '').trim();
     if (!text || text.startsWith('/')) return;
 
-    // Check conversation state
     const userId = String(msg.from.id);
     const state = _state.get(userId);
     if (state) {
@@ -92,59 +102,152 @@ function _registerHandlers() {
     }
 
     // Auto-detect ERC20 contract address
-    const ethAddrMatch = text.match(/^(0x[a-fA-F0-9]{40})$/);
-    if (ethAddrMatch) {
-      await _showBuyInterface(msg.chat.id, userId, ethAddrMatch[1]);
+    if (/^0x[a-fA-F0-9]{40}$/.test(text)) {
+      await _showBuyInterface(msg.chat.id, userId, text);
     }
   });
 
-  // ── Callback queries (button clicks) ──
+  // Callback queries
   bot.on('callback_query', async (query) => {
     const userId = String(query.from.id);
     if (!_config.authorizedUsers.includes(userId)) {
       return bot.answerCallbackQuery(query.id, { text: 'Unauthorized' });
     }
-
-    const data = query.data;
-    const chatId = query.message.chat.id;
-
     try {
-      if (data === 'menu:main') {
-        await bot.answerCallbackQuery(query.id);
-        await _sendMainMenu(chatId, userId, query.message.message_id);
-      } else if (data === 'menu:wallet') {
-        await bot.answerCallbackQuery(query.id);
-        await _sendWalletMenu(chatId, userId, query.message.message_id);
-      } else if (data === 'menu:positions') {
-        await bot.answerCallbackQuery(query.id);
-        await _sendPositions(chatId, userId);
-      } else if (data === 'wallet:generate') {
-        await bot.answerCallbackQuery(query.id);
-        _state.set(userId, { step: 'wallet_generate_label' });
-        bot.sendMessage(chatId, '🏷️ Label pour ce nouveau wallet ?\n(ex: "Sniper", "Main", "Degen")');
-      } else if (data === 'wallet:import') {
-        await bot.answerCallbackQuery(query.id);
-        _state.set(userId, { step: 'wallet_import_pk' });
-        bot.sendMessage(chatId,
-          '🔑 Colle la clé privée du wallet à importer.\n\n' +
-          '⚠️ Ne partage JAMAIS cette clé avec qui que ce soit. Elle sera chiffrée AES-256 dans le bot.'
-        );
-      } else if (data.startsWith('buy:')) {
-        await _handleBuyCallback(query, data);
-      } else if (data.startsWith('sell:')) {
-        await _handleSellCallback(query, data);
-      } else if (data === 'cancel') {
-        _state.delete(userId);
-        await bot.answerCallbackQuery(query.id, { text: 'Annulé' });
-        await bot.deleteMessage(chatId, query.message.message_id).catch(() => {});
-      } else {
-        await bot.answerCallbackQuery(query.id);
-      }
+      await _handleCallback(query, userId);
     } catch (err) {
       console.error('Callback error:', err.message);
       await bot.answerCallbackQuery(query.id, { text: `Erreur: ${err.message.slice(0, 50)}` });
     }
   });
+}
+
+async function _handleCallback(query, userId) {
+  const data = query.data;
+  const chatId = query.message.chat.id;
+  const msgId = query.message.message_id;
+
+  // Navigation
+  if (data === 'nav:main') {
+    await bot.answerCallbackQuery(query.id);
+    return _sendMainMenu(chatId, userId, msgId);
+  }
+  if (data === 'nav:wallets') {
+    await bot.answerCallbackQuery(query.id);
+    return _sendWalletsMenu(chatId, userId, msgId);
+  }
+  if (data === 'nav:positions') {
+    await bot.answerCallbackQuery(query.id);
+    return _sendPositions(chatId, userId);
+  }
+  if (data === 'nav:settings') {
+    await bot.answerCallbackQuery(query.id);
+    return _sendSettingsMenu(chatId, userId, msgId);
+  }
+  if (data === 'nav:close' || data === 'cancel') {
+    _state.delete(userId);
+    await bot.answerCallbackQuery(query.id);
+    return bot.deleteMessage(chatId, msgId).catch(() => {});
+  }
+
+  // Wallet actions
+  if (data === 'wallet:create') {
+    await bot.answerCallbackQuery(query.id);
+    _state.set(userId, { step: 'wallet_create_label' });
+    return bot.sendMessage(chatId, '🏷️ Nom du nouveau wallet ?\n(ex: "Main", "Sniper", "Degen")');
+  }
+  if (data === 'wallet:import') {
+    await bot.answerCallbackQuery(query.id);
+    _state.set(userId, { step: 'wallet_import_pk' });
+    return bot.sendMessage(chatId,
+      '🔑 Colle la clé privée du wallet à importer.\n\n' +
+      '⚠️ Ne partage JAMAIS cette clé. Elle sera chiffrée AES-256 et ton message sera supprimé.'
+    );
+  }
+  if (data === 'wallet:rename') {
+    await bot.answerCallbackQuery(query.id);
+    return _sendWalletPicker(chatId, userId, 'rename', msgId);
+  }
+  if (data === 'wallet:remove') {
+    await bot.answerCallbackQuery(query.id);
+    return _sendWalletPicker(chatId, userId, 'remove', msgId);
+  }
+  if (data === 'wallet:keys') {
+    await bot.answerCallbackQuery(query.id);
+    return _sendWalletPicker(chatId, userId, 'reveal', msgId);
+  }
+  if (data === 'wallet:setdefault') {
+    await bot.answerCallbackQuery(query.id);
+    return _sendWalletPicker(chatId, userId, 'setdefault', msgId);
+  }
+
+  if (data.startsWith('walletsel:')) {
+    const [, action, walletId] = data.split(':');
+    await bot.answerCallbackQuery(query.id);
+    if (action === 'rename') {
+      _state.set(userId, { step: 'wallet_rename_label', data: { walletId } });
+      return bot.sendMessage(chatId, '🏷️ Nouveau nom ?');
+    }
+    if (action === 'remove') {
+      const w = wallet.getWalletById(userId, walletId);
+      if (!w) return;
+      return bot.sendMessage(chatId,
+        `⚠️ Supprimer *${w.label}* (\`${w.address}\`) ?\n\n` +
+        `Cette action est *irréversible*. Exporte la clé privée d'abord si nécessaire.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '🗑️ Confirmer', callback_data: `walletdel:${walletId}` },
+              { text: '❌ Annuler', callback_data: 'cancel' },
+            ]],
+          },
+        }
+      );
+    }
+    if (action === 'reveal') {
+      const pk = wallet.revealPrivateKey(userId, walletId);
+      const w = wallet.getWalletById(userId, walletId);
+      const keyMsg = await bot.sendMessage(chatId,
+        `🔑 *Clé privée — ${w.label}*\n\n` +
+        `\`${pk}\`\n\n` +
+        `⚠️ Ne partage JAMAIS cette clé.\n_Ce message sera supprimé dans 60 secondes._`,
+        { parse_mode: 'Markdown' }
+      );
+      setTimeout(() => bot.deleteMessage(chatId, keyMsg.message_id).catch(() => {}), 60000);
+      return;
+    }
+    if (action === 'setdefault') {
+      _getUserPrefs(userId).activeWalletId = walletId;
+      return _sendWalletsMenu(chatId, userId, msgId);
+    }
+  }
+  if (data.startsWith('walletdel:')) {
+    const [, walletId] = data.split(':');
+    wallet.deleteWallet(userId, walletId);
+    await bot.answerCallbackQuery(query.id, { text: 'Wallet supprimé' });
+    return bot.deleteMessage(chatId, msgId).catch(() => {});
+  }
+
+  // Buy flow
+  if (data.startsWith('buy:')) {
+    return _handleBuyCallback(query, data, userId);
+  }
+
+  // Sell flow
+  if (data.startsWith('sell:')) {
+    return _handleSellCallback(query, data, userId);
+  }
+
+  // Settings
+  if (data === 'settings:slippage') {
+    await bot.answerCallbackQuery(query.id);
+    _state.set(userId, { step: 'settings_slippage' });
+    return bot.sendMessage(chatId, '📊 Slippage en % ? (ex: 1 pour 1%, 5 pour 5%, max 30)');
+  }
+
+  // Default: ack
+  await bot.answerCallbackQuery(query.id);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -154,209 +257,289 @@ function _registerHandlers() {
 async function _sendMainMenu(chatId, userId, editMsgId = null) {
   const wallets = wallet.listWallets(userId);
   const stats = positions.getStats(userId);
-  const openPos = positions.getPositions(userId);
 
-  const text =
-    `🤖 *JARVIS TRADE*\n\n` +
-    `💼 Wallets: ${wallets.length}\n` +
-    `📊 Positions ouvertes: ${openPos.length}\n` +
-    `💰 PnL réalisé: ${stats.realizedPnl >= 0 ? '+' : ''}$${stats.realizedPnl.toFixed(2)}\n\n` +
-    `_Colle un contract address pour acheter_`;
-
-  const keyboard = {
-    inline_keyboard: [
-      [
-        { text: '💼 Wallets', callback_data: 'menu:wallet' },
-        { text: '📊 Positions', callback_data: 'menu:positions' },
-      ],
-      [
-        { text: '📈 Stats', callback_data: 'menu:stats' },
-        { text: '⚙️ Settings', callback_data: 'menu:settings' },
-      ],
-    ],
-  };
-
-  if (editMsgId) {
-    await bot.editMessageText(text, {
-      chat_id: chatId, message_id: editMsgId,
-      parse_mode: 'Markdown', reply_markup: keyboard,
-    }).catch(() => bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard }));
-  } else {
-    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard });
-  }
-}
-
-// ════════════════════════════════════════════════════════════
-// WALLET MENU
-// ════════════════════════════════════════════════════════════
-
-async function _sendWalletMenu(chatId, userId, editMsgId = null) {
-  const wallets = wallet.listWallets(userId);
-
-  let text = `💼 *Wallets*\n\n`;
-  if (wallets.length === 0) {
-    text += `_Aucun wallet. Génère ou importe un wallet pour commencer._`;
-  } else {
-    // Show ETH balance on both chains for each wallet
-    for (const w of wallets) {
-      const [baseBal, ethBal] = await Promise.all([
+  // Total wallet worth (ETH balance only for now, in USD)
+  let totalEth = 0n;
+  for (const w of wallets) {
+    try {
+      const [base, eth] = await Promise.all([
         trading.getEthBalance('base', w.address).catch(() => 0n),
         trading.getEthBalance('ethereum', w.address).catch(() => 0n),
       ]);
-      text += `*${w.label}* \`${w.address.slice(0, 6)}...${w.address.slice(-4)}\`\n`;
-      text += `  Base: ${ethers.formatEther(baseBal).slice(0, 8)} ETH\n`;
-      text += `  Ethereum: ${ethers.formatEther(ethBal).slice(0, 8)} ETH\n\n`;
-    }
+      totalEth += base + eth;
+    } catch (_) {}
+  }
+  const ethPrice = await price.getEthPrice().catch(() => 0);
+  const walletWorthUsd = parseFloat(ethers.formatEther(totalEth)) * ethPrice;
+
+  const text =
+    `🤖 *JARVIS TRADE*\n` +
+    `_Your custom trading bot · 0% fees_\n\n` +
+    `💰 Wallet Worth: *${_fmtUsd(walletWorthUsd)}*\n` +
+    `💼 Wallets: ${wallets.length} · 📊 Positions: ${stats.openPositions}\n` +
+    `📈 Realized PnL: *${stats.realizedPnl >= 0 ? '+' : ''}$${stats.realizedPnl.toFixed(2)}*\n\n` +
+    `_Paste a contract address (0x...) to buy a token_`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [
+        { text: '💎 Buy / Snipe', callback_data: 'buy:prompt' },
+        { text: '📊 Positions', callback_data: 'nav:positions' },
+      ],
+      [
+        { text: '💼 Wallets', callback_data: 'nav:wallets' },
+        { text: '🔁 Transfers', callback_data: 'nav:transfers' },
+      ],
+      [
+        { text: '📈 Stats', callback_data: 'nav:stats' },
+        { text: '⚙️ Settings', callback_data: 'nav:settings' },
+      ],
+      [{ text: '❌ Close', callback_data: 'nav:close' }],
+    ],
+  };
+
+  const opts = { parse_mode: 'Markdown', reply_markup: keyboard };
+  if (editMsgId) {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: editMsgId, ...opts })
+      .catch(() => bot.sendMessage(chatId, text, opts));
+  } else {
+    await bot.sendMessage(chatId, text, opts);
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+// WALLETS MENU (Sigma-style)
+// ════════════════════════════════════════════════════════════
+
+async function _sendWalletsMenu(chatId, userId, editMsgId = null) {
+  const wallets = wallet.listWallets(userId);
+  const prefs = _getUserPrefs(userId);
+
+  let text = `💼 *Settings › Wallets*\n\n`;
+
+  if (wallets.length === 0) {
+    text += `_No wallets. Create or import one to get started._`;
+  } else {
+    let totalEth = 0n;
+    const balances = await Promise.all(wallets.map(async (w) => {
+      const [base, eth] = await Promise.all([
+        trading.getEthBalance('base', w.address).catch(() => 0n),
+        trading.getEthBalance('ethereum', w.address).catch(() => 0n),
+      ]);
+      const total = base + eth;
+      totalEth += total;
+      return { base, eth, total };
+    }));
+    const ethPrice = await price.getEthPrice().catch(() => 0);
+    const worth = parseFloat(ethers.formatEther(totalEth)) * ethPrice;
+
+    text += `📊 Wallet Worth: *${_fmtUsd(worth)}*\n\n`;
+    text += `_Your wallets:_\n\n`;
+
+    wallets.forEach((w, i) => {
+      const b = balances[i];
+      const isDefault = w.id === prefs.activeWalletId;
+      text += `${isDefault ? '⭐ ' : ''}*${i + 1}. ${w.label}*  `;
+      text += `\`${_fmtEth(b.total)} Ξ\`\n`;
+      text += `\`${w.address}\`\n\n`;
+    });
   }
 
   const keyboard = {
     inline_keyboard: [
       [
-        { text: '➕ Generate', callback_data: 'wallet:generate' },
+        { text: '➕ Create', callback_data: 'wallet:create' },
         { text: '📥 Import', callback_data: 'wallet:import' },
       ],
-      [{ text: '⬅️ Back', callback_data: 'menu:main' }],
+      [
+        { text: '✏️ Rename', callback_data: 'wallet:rename' },
+        { text: '🗑️ Remove', callback_data: 'wallet:remove' },
+      ],
+      [
+        { text: '🔑 Private Keys', callback_data: 'wallet:keys' },
+        { text: '⭐ Set Default', callback_data: 'wallet:setdefault' },
+      ],
+      [{ text: '⬅️ Back', callback_data: 'nav:main' }],
     ],
   };
 
+  const opts = { parse_mode: 'Markdown', reply_markup: keyboard };
   if (editMsgId) {
-    await bot.editMessageText(text, {
-      chat_id: chatId, message_id: editMsgId,
-      parse_mode: 'Markdown', reply_markup: keyboard,
-    }).catch(() => bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard }));
+    await bot.editMessageText(text, { chat_id: chatId, message_id: editMsgId, ...opts })
+      .catch(() => bot.sendMessage(chatId, text, opts));
   } else {
-    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard });
+    await bot.sendMessage(chatId, text, opts);
+  }
+}
+
+async function _sendWalletPicker(chatId, userId, action, editMsgId = null) {
+  const wallets = wallet.listWallets(userId);
+  if (wallets.length === 0) {
+    return bot.sendMessage(chatId, '⚠️ Aucun wallet disponible.');
+  }
+
+  const actionLabels = {
+    rename: '✏️ Rename',
+    remove: '🗑️ Remove',
+    reveal: '🔑 View Key',
+    setdefault: '⭐ Set Default',
+  };
+
+  const text = `*${actionLabels[action]}* — Select a wallet:`;
+  const keyboard = {
+    inline_keyboard: [
+      ...wallets.map((w, i) => [{
+        text: `${i + 1}. ${w.label} (${_shortAddr(w.address)})`,
+        callback_data: `walletsel:${action}:${w.id}`,
+      }]),
+      [{ text: '⬅️ Back', callback_data: 'nav:wallets' }],
+    ],
+  };
+
+  const opts = { parse_mode: 'Markdown', reply_markup: keyboard };
+  if (editMsgId) {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: editMsgId, ...opts })
+      .catch(() => bot.sendMessage(chatId, text, opts));
+  } else {
+    await bot.sendMessage(chatId, text, opts);
   }
 }
 
 // ════════════════════════════════════════════════════════════
-// POSITIONS
-// ════════════════════════════════════════════════════════════
-
-async function _sendPositions(chatId, userId) {
-  const pos = positions.getPositions(userId);
-  if (pos.length === 0) {
-    return bot.sendMessage(chatId, '📊 Aucune position ouverte.');
-  }
-
-  // Fetch current prices
-  const byChain = {};
-  pos.forEach(p => {
-    if (!byChain[p.chain]) byChain[p.chain] = [];
-    byChain[p.chain].push(p.tokenAddress);
-  });
-
-  const pricesByChain = {};
-  for (const [chain, addrs] of Object.entries(byChain)) {
-    pricesByChain[chain] = await price.getTokenPrices(chain, addrs);
-  }
-
-  let text = `📊 *Positions ouvertes* (${pos.length})\n\n`;
-  for (const p of pos) {
-    const currentPrice = pricesByChain[p.chain]?.[p.tokenAddress.toLowerCase()]?.priceUsd || 0;
-    const currentValue = p.amountTokens * currentPrice;
-    const pnl = currentValue - p.totalCostUsd;
-    const pnlPct = p.totalCostUsd > 0 ? (pnl / p.totalCostUsd) * 100 : 0;
-    const pnlEmoji = pnl >= 0 ? '🟢' : '🔴';
-    const pnlSign = pnl >= 0 ? '+' : '';
-
-    text += `${pnlEmoji} *${p.symbol}* (${p.chain})\n`;
-    text += `  Entry: $${p.avgEntryUsd.toFixed(6)} → Now: $${currentPrice.toFixed(6)}\n`;
-    text += `  Amount: ${p.amountTokens.toFixed(4)} | Value: $${currentValue.toFixed(2)}\n`;
-    text += `  PnL: ${pnlSign}$${pnl.toFixed(2)} (${pnlSign}${pnlPct.toFixed(1)}%)\n\n`;
-  }
-
-  await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
-}
-
-// ════════════════════════════════════════════════════════════
-// BUY FLOW
+// BUY FLOW (Sigma-style token card)
 // ════════════════════════════════════════════════════════════
 
 async function _showBuyInterface(chatId, userId, tokenAddress) {
   const wallets = wallet.listWallets(userId);
   if (wallets.length === 0) {
-    return bot.sendMessage(chatId, '⚠️ Aucun wallet. Utilise /wallet pour en créer un.');
+    return bot.sendMessage(chatId, '⚠️ Aucun wallet. Utilise /wallets pour en créer un.');
   }
+  const prefs = _getUserPrefs(userId);
+  const activeWallet = prefs.activeWalletId
+    ? wallets.find(w => w.id === prefs.activeWalletId) || wallets[0]
+    : wallets[0];
 
-  // Try to get token info on Base first, then Ethereum
+  // Determine chain & fetch info
   let chain = 'base';
-  let info = null;
-  let dexInfo = null;
-  try {
-    info = await trading.getTokenInfo('base', tokenAddress, wallets[0].address);
-    dexInfo = await price.getTokenPrice('base', tokenAddress);
-    if (!dexInfo || dexInfo.priceUsd === 0) throw new Error('no base liquidity');
-  } catch (_) {
-    try {
-      chain = 'ethereum';
-      info = await trading.getTokenInfo('ethereum', tokenAddress, wallets[0].address);
-      dexInfo = await price.getTokenPrice('ethereum', tokenAddress);
-    } catch (err) {
-      return bot.sendMessage(chatId, `❌ Token introuvable ou pas de liquidité:\n\`${tokenAddress}\``, { parse_mode: 'Markdown' });
+  let dexInfo = await price.getTokenPrice('base', tokenAddress);
+  if (!dexInfo || dexInfo.priceUsd === 0) {
+    chain = 'ethereum';
+    dexInfo = await price.getTokenPrice('ethereum', tokenAddress);
+    if (!dexInfo || dexInfo.priceUsd === 0) {
+      return bot.sendMessage(chatId,
+        `❌ Token not found or no liquidity:\n\`${tokenAddress}\``,
+        { parse_mode: 'Markdown' }
+      );
     }
   }
 
-  const symbol = dexInfo?.symbol || info?.symbol || 'UNKNOWN';
-  const name = dexInfo?.name || '';
-  const priceUsd = dexInfo?.priceUsd || 0;
-  const liq = dexInfo?.liquidityUsd || 0;
-  const vol = dexInfo?.volume24h || 0;
-  const change = dexInfo?.priceChange24h || 0;
+  // Fetch all wallets' ETH balances on this chain
+  const walletBals = await Promise.all(wallets.map(w => trading.getEthBalance(chain, w.address).catch(() => 0n)));
 
-  const text =
-    `💎 *${symbol}* ${name ? `— ${name}` : ''}\n` +
-    `Chain: *${chain}* · \`${tokenAddress.slice(0,6)}...${tokenAddress.slice(-4)}\`\n\n` +
-    `Price: *$${priceUsd.toFixed(6)}* (${change >= 0 ? '+' : ''}${change.toFixed(1)}%)\n` +
-    `Liq: $${(liq/1000).toFixed(1)}K · Vol24h: $${(vol/1000).toFixed(1)}K\n\n` +
-    `_Choisis un montant:_`;
+  const symbol = dexInfo.symbol || 'UNKNOWN';
+  const name = dexInfo.name || symbol;
+  const priceUsd = dexInfo.priceUsd;
+  const mcap = dexInfo.fdv || 0;
+  const liq = dexInfo.liquidityUsd;
+  const change = dexInfo.priceChange24h || 0;
+  const chainIcon = chain === 'base' ? '🔵' : '⟠';
+  const chainName = chain === 'base' ? 'BASE' : 'ETHEREUM';
+  const changeEmoji = change >= 0 ? '🟢' : '🔴';
 
-  // Build preset buttons (2 rows of presets + wallet selector)
+  let text = `💎 *${name}* | *${symbol}* (${chainIcon} ${chainName})\n`;
+  text += `\`${tokenAddress}\`\n\n`;
+  text += `💰 *Pool Info:*\n`;
+  text += `🏭 DEX: ${dexInfo.dex || 'Unknown'}\n`;
+  text += `💵 Price: $${priceUsd.toFixed(8)} (${changeEmoji} ${change >= 0 ? '+' : ''}${change.toFixed(1)}%)\n`;
+  text += `💧 Liq: ${_fmtUsd(liq)}\n`;
+  text += `📊 Vol 24h: ${_fmtUsd(dexInfo.volume24h || 0)}\n\n`;
+  text += `💼 *Your Wallets (${chainName}):*\n`;
+  wallets.forEach((w, i) => {
+    const eth = parseFloat(ethers.formatEther(walletBals[i]));
+    const isActive = w.id === activeWallet.id ? '⭐ ' : '';
+    text += `${isActive}W${i + 1}: ${eth.toFixed(4)}Ξ\n`;
+  });
+  text += `\n_Active wallet: ${activeWallet.label}_\n`;
+  text += `_Slippage: ${prefs.slippageBps / 100}%_`;
+
   const presets = _config.presets.buy;
-  const presetRows = [];
-  for (let i = 0; i < presets.length; i += 3) {
-    presetRows.push(presets.slice(i, i + 3).map(amt => ({
-      text: `${amt} ETH`,
-      callback_data: `buy:preset:${chain}:${tokenAddress}:${amt}:${wallets[0].id}`,
-    })));
-  }
+  const presetBtns = presets.map(amt => ({
+    text: `💰 Buy ${amt}Ξ`,
+    callback_data: `buy:preset:${chain}:${tokenAddress}:${amt}:${activeWallet.id}`,
+  }));
+
+  // Wallet selector row (W1/W2/W3/W4)
+  const walletBtns = wallets.slice(0, 4).map((w, i) => ({
+    text: `${w.id === activeWallet.id ? '🟢' : '⚪'} W${i + 1}`,
+    callback_data: `buy:walletsel:${chain}:${tokenAddress}:${w.id}`,
+  }));
 
   const keyboard = {
     inline_keyboard: [
-      ...presetRows,
+      [{ text: '🔄 Refresh', callback_data: `buy:refresh:${chain}:${tokenAddress}` }],
+      presetBtns.slice(0, 3),
+      presetBtns.slice(3, 5),
       [
-        { text: '✏️ Custom', callback_data: `buy:custom:${chain}:${tokenAddress}:${wallets[0].id}` },
-        { text: '💼 Change wallet', callback_data: `buy:wallet:${chain}:${tokenAddress}` },
+        { text: '✏️ Buy X (Custom)', callback_data: `buy:custom:${chain}:${tokenAddress}:${activeWallet.id}` },
       ],
-      [{ text: '❌ Cancel', callback_data: 'cancel' }],
+      walletBtns,
+      [
+        { text: `📊 Slip ${prefs.slippageBps / 100}%`, callback_data: 'settings:slippage' },
+        { text: '❌ Close', callback_data: 'nav:close' },
+      ],
     ],
   };
 
   await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard });
 }
 
-async function _handleBuyCallback(query, data) {
+async function _handleBuyCallback(query, data, userId) {
   const parts = data.split(':');
   const action = parts[1];
   const chatId = query.message.chat.id;
-  const userId = String(query.from.id);
+  const msgId = query.message.message_id;
+
+  if (action === 'prompt') {
+    await bot.answerCallbackQuery(query.id);
+    return bot.sendMessage(chatId, '💎 Paste a contract address (0x...) to buy a token.');
+  }
+
+  if (action === 'refresh') {
+    const [, , chain, tokenAddr] = parts;
+    await bot.answerCallbackQuery(query.id, { text: '🔄 Refreshing...' });
+    await bot.deleteMessage(chatId, msgId).catch(() => {});
+    return _showBuyInterface(chatId, userId, tokenAddr);
+  }
+
+  if (action === 'walletsel') {
+    const [, , , tokenAddr, walletId] = parts;
+    _getUserPrefs(userId).activeWalletId = walletId;
+    await bot.answerCallbackQuery(query.id, { text: 'Wallet changé' });
+    await bot.deleteMessage(chatId, msgId).catch(() => {});
+    return _showBuyInterface(chatId, userId, tokenAddr);
+  }
 
   if (action === 'preset') {
     const [, , chain, tokenAddr, amountStr, walletId] = parts;
     const amount = parseFloat(amountStr);
     await bot.answerCallbackQuery(query.id, { text: `Achat ${amount} ETH en cours...` });
-    await _executeBuy(chatId, userId, walletId, chain, tokenAddr, amount);
-  } else if (action === 'custom') {
+    return _executeBuy(chatId, userId, walletId, chain, tokenAddr, amount);
+  }
+
+  if (action === 'custom') {
     const [, , chain, tokenAddr, walletId] = parts;
     _state.set(userId, { step: 'buy_custom_amount', data: { chain, tokenAddr, walletId } });
     await bot.answerCallbackQuery(query.id);
-    bot.sendMessage(chatId, '💵 Montant d\'ETH à dépenser ? (ex: 0.15)');
+    return bot.sendMessage(chatId, '💵 Montant d\'ETH à dépenser ? (ex: 0.15)');
   }
 }
 
 async function _executeBuy(chatId, userId, walletId, chain, tokenAddr, amountEth) {
   const loadingMsg = await bot.sendMessage(chatId,
-    `⏳ Achat en cours...\nAmount: ${amountEth} ETH\nToken: \`${tokenAddr.slice(0,10)}...\`\nChain: ${chain}`,
+    `⏳ *Buy in progress*\n\n` +
+    `Token: \`${_shortAddr(tokenAddr)}\`\n` +
+    `Chain: ${chain}\n` +
+    `Amount: ${amountEth} ETH`,
     { parse_mode: 'Markdown' }
   );
 
@@ -364,16 +547,17 @@ async function _executeBuy(chatId, userId, walletId, chain, tokenAddr, amountEth
     const provider = trading.getProvider(chain);
     const signer = wallet.getSigner(userId, walletId, provider);
     const w = wallet.getWalletById(userId, walletId);
+    const prefs = _getUserPrefs(userId);
 
-    // Check balance
     const balance = await trading.getEthBalance(chain, w.address);
     if (balance < ethers.parseEther(amountEth.toString())) {
-      return bot.editMessageText(`❌ Balance insuffisante. Wallet a ${ethers.formatEther(balance).slice(0,8)} ETH, besoin de ${amountEth}`, {
-        chat_id: chatId, message_id: loadingMsg.message_id,
-      });
+      return bot.editMessageText(
+        `❌ Balance insuffisante\n\nWallet a ${_fmtEth(balance)} ETH, besoin ${amountEth} ETH`,
+        { chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown' }
+      );
     }
 
-    const result = await trading.buy(chain, tokenAddr, amountEth, _config.trading.defaultSlippageBps, signer);
+    const result = await trading.buy(chain, tokenAddr, amountEth, prefs.slippageBps, signer);
 
     // Record position
     const info = await trading.getTokenInfo(chain, tokenAddr, w.address);
@@ -390,25 +574,175 @@ async function _executeBuy(chatId, userId, walletId, chain, tokenAddr, amountEth
     });
 
     const explorer = _config.chains[chain].explorer;
+    const tokensReceived = Number(ethers.formatUnits(result.amountOutExpected, info.decimals));
+
     await bot.editMessageText(
-      `✅ *Achat réussi*\n\n` +
-      `${info.symbol} acheté via ${result.dex}\n` +
-      `Montant: ${Number(ethers.formatUnits(result.amountOutExpected, info.decimals)).toFixed(4)} ${info.symbol}\n` +
-      `Coût: ${amountEth} ETH\n\n` +
-      `[Voir tx](${explorer}/tx/${result.txHash})`,
+      `✅ *Buy successful*\n\n` +
+      `💎 ${info.symbol} bought via ${result.dex}\n` +
+      `💰 Spent: ${amountEth} ETH\n` +
+      `📦 Received: ${tokensReceived.toFixed(4)} ${info.symbol}\n` +
+      `💵 Entry: $${(amountEth * ethPrice / tokensReceived).toFixed(6)}\n\n` +
+      `[View tx](${explorer}/tx/${result.txHash})`,
       { chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown', disable_web_page_preview: true }
     );
   } catch (err) {
     console.error('Buy error:', err.message);
-    await bot.editMessageText(`❌ Erreur d'achat:\n\`${err.message.slice(0, 200)}\``, {
-      chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown',
-    });
+    await bot.editMessageText(
+      `❌ Buy failed\n\n\`${err.message.slice(0, 200)}\``,
+      { chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown' }
+    );
   }
 }
 
-async function _handleSellCallback(query, data) {
-  // TODO: implement sell flow
-  await bot.answerCallbackQuery(query.id, { text: 'Sell flow — à implémenter' });
+// ════════════════════════════════════════════════════════════
+// POSITIONS
+// ════════════════════════════════════════════════════════════
+
+async function _sendPositions(chatId, userId) {
+  const pos = positions.getPositions(userId);
+  if (pos.length === 0) {
+    return bot.sendMessage(chatId, '📊 No open positions.\n\n_Paste a contract address to buy a token._', { parse_mode: 'Markdown' });
+  }
+
+  // Fetch prices
+  const byChain = {};
+  pos.forEach(p => {
+    if (!byChain[p.chain]) byChain[p.chain] = [];
+    byChain[p.chain].push(p.tokenAddress);
+  });
+  const pricesByChain = {};
+  for (const [chain, addrs] of Object.entries(byChain)) {
+    pricesByChain[chain] = await price.getTokenPrices(chain, addrs);
+  }
+
+  let text = `📊 *Open Positions* (${pos.length})\n\n`;
+  for (const p of pos) {
+    const current = pricesByChain[p.chain]?.[p.tokenAddress.toLowerCase()]?.priceUsd || 0;
+    const value = p.amountTokens * current;
+    const pnl = value - p.totalCostUsd;
+    const pnlPct = p.totalCostUsd > 0 ? (pnl / p.totalCostUsd) * 100 : 0;
+    const emoji = pnl >= 0 ? '🟢' : '🔴';
+    const sign = pnl >= 0 ? '+' : '';
+
+    text += `${emoji} *${p.symbol}* (${p.chain})\n`;
+    text += `  Entry: $${p.avgEntryUsd.toFixed(6)} → Now: $${current.toFixed(6)}\n`;
+    text += `  Amount: ${p.amountTokens.toFixed(2)} | Value: ${_fmtUsd(value)}\n`;
+    text += `  PnL: ${sign}${_fmtUsd(pnl)} (${sign}${pnlPct.toFixed(1)}%)\n\n`;
+  }
+
+  // Sell buttons per position
+  const sellButtons = pos.flatMap((p, i) => [[
+    { text: `💸 ${p.symbol} 25%`, callback_data: `sell:pct:${p.chain}:${p.tokenAddress}:25:${p.walletId}` },
+    { text: '50%', callback_data: `sell:pct:${p.chain}:${p.tokenAddress}:50:${p.walletId}` },
+    { text: '100%', callback_data: `sell:pct:${p.chain}:${p.tokenAddress}:100:${p.walletId}` },
+  ]]);
+
+  const keyboard = {
+    inline_keyboard: [
+      ...sellButtons.slice(0, 8), // cap at 8 rows (8 positions)
+      [{ text: '⬅️ Main menu', callback_data: 'nav:main' }],
+    ],
+  };
+
+  await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+async function _handleSellCallback(query, data, userId) {
+  const parts = data.split(':');
+  const action = parts[1];
+  const chatId = query.message.chat.id;
+
+  if (action === 'pct') {
+    const [, , chain, tokenAddr, pctStr, walletId] = parts;
+    const pct = parseInt(pctStr, 10);
+    await bot.answerCallbackQuery(query.id, { text: `Selling ${pct}%...` });
+    return _executeSell(chatId, userId, walletId, chain, tokenAddr, pct);
+  }
+}
+
+async function _executeSell(chatId, userId, walletId, chain, tokenAddr, pct) {
+  const loadingMsg = await bot.sendMessage(chatId,
+    `⏳ *Sell in progress*\n\nAmount: ${pct}%\nChain: ${chain}`,
+    { parse_mode: 'Markdown' }
+  );
+
+  try {
+    const provider = trading.getProvider(chain);
+    const signer = wallet.getSigner(userId, walletId, provider);
+    const w = wallet.getWalletById(userId, walletId);
+    const prefs = _getUserPrefs(userId);
+
+    // Get current balance of token
+    const info = await trading.getTokenInfo(chain, tokenAddr, w.address);
+    if (info.balance === 0n) {
+      return bot.editMessageText(`❌ No ${info.symbol} balance in this wallet.`,
+        { chat_id: chatId, message_id: loadingMsg.message_id });
+    }
+    const amountIn = info.balance * BigInt(pct) / 100n;
+
+    const result = await trading.sell(chain, tokenAddr, amountIn, prefs.slippageBps, signer);
+
+    const ethPrice = await price.getEthPrice();
+    const { realizedPnl } = positions.recordSell({
+      userId, walletId, walletAddr: w.address, chain,
+      tokenAddress: tokenAddr,
+      symbol: info.symbol,
+      decimals: info.decimals,
+      amountTokens: amountIn,
+      amountEthReceived: result.amountOutExpected,
+      ethPriceUsd: ethPrice,
+      txHash: result.txHash,
+    });
+
+    const ethOut = _fmtEth(result.amountOutExpected);
+    const explorer = _config.chains[chain].explorer;
+    const pnlEmoji = realizedPnl >= 0 ? '🟢' : '🔴';
+    const pnlSign = realizedPnl >= 0 ? '+' : '';
+
+    await bot.editMessageText(
+      `✅ *Sell successful*\n\n` +
+      `${pnlEmoji} ${info.symbol} sold via ${result.dex}\n` +
+      `📦 Sold: ${Number(ethers.formatUnits(amountIn, info.decimals)).toFixed(4)} ${info.symbol}\n` +
+      `💰 Received: ${ethOut} ETH (${_fmtUsd(parseFloat(ethOut) * ethPrice)})\n` +
+      `📈 Realized PnL: *${pnlSign}${_fmtUsd(realizedPnl)}*\n\n` +
+      `[View tx](${explorer}/tx/${result.txHash})`,
+      { chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown', disable_web_page_preview: true }
+    );
+  } catch (err) {
+    console.error('Sell error:', err.message);
+    await bot.editMessageText(
+      `❌ Sell failed\n\n\`${err.message.slice(0, 200)}\``,
+      { chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown' }
+    );
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+// SETTINGS
+// ════════════════════════════════════════════════════════════
+
+async function _sendSettingsMenu(chatId, userId, editMsgId = null) {
+  const prefs = _getUserPrefs(userId);
+  const text =
+    `⚙️ *Settings*\n\n` +
+    `📊 Slippage: *${prefs.slippageBps / 100}%*\n` +
+    `⛽ Gas buffer: x${_config.trading.defaultGasBufferMultiplier}\n` +
+    `💰 Buy presets: ${_config.presets.buy.join(', ')} ETH`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '📊 Slippage', callback_data: 'settings:slippage' }],
+      [{ text: '⬅️ Main menu', callback_data: 'nav:main' }],
+    ],
+  };
+
+  const opts = { parse_mode: 'Markdown', reply_markup: keyboard };
+  if (editMsgId) {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: editMsgId, ...opts })
+      .catch(() => bot.sendMessage(chatId, text, opts));
+  } else {
+    await bot.sendMessage(chatId, text, opts);
+  }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -420,41 +754,64 @@ async function _handleStatefulInput(msg, state) {
   const chatId = msg.chat.id;
   const text = msg.text.trim();
 
-  if (state.step === 'wallet_generate_label') {
+  if (state.step === 'wallet_create_label') {
     const label = text.slice(0, 40);
-    const newWallet = wallet.generateWallet(userId, label);
+    const w = wallet.generateWallet(userId, label);
     _state.delete(userId);
-    bot.sendMessage(chatId,
-      `✅ *Wallet créé*\n\n` +
-      `Label: *${newWallet.label}*\n` +
-      `Address: \`${newWallet.address}\`\n\n` +
-      (newWallet.mnemonic ? `🔐 *Mnemonic* (à sauvegarder IMMÉDIATEMENT, ne sera JAMAIS réaffiché):\n\`${newWallet.mnemonic}\`\n\n⚠️ Supprime ce message après avoir sauvegardé.` : ''),
+    await bot.sendMessage(chatId,
+      `✅ *Wallet created*\n\n` +
+      `Label: *${w.label}*\n` +
+      `Address: \`${w.address}\`\n\n` +
+      (w.mnemonic
+        ? `🔐 *Mnemonic* (sauvegarde IMMÉDIATEMENT, ne sera JAMAIS réaffiché):\n\`${w.mnemonic}\`\n\n⚠️ Supprime ce message après avoir sauvegardé.`
+        : ''),
       { parse_mode: 'Markdown' }
     );
-  } else if (state.step === 'wallet_import_pk') {
+    return _sendWalletsMenu(chatId, userId);
+  }
+
+  if (state.step === 'wallet_import_pk') {
     try {
       const imported = wallet.importWallet(userId, text, 'Imported');
       _state.delete(userId);
-      // Delete message containing private key
       await bot.deleteMessage(chatId, msg.message_id).catch(() => {});
-      bot.sendMessage(chatId,
-        `✅ *Wallet importé*\n\n` +
-        `Address: \`${imported.address}\`\n\n` +
-        `🔐 Ton message avec la clé privée a été supprimé.`,
+      await bot.sendMessage(chatId,
+        `✅ *Wallet imported*\n\nAddress: \`${imported.address}\`\n\n🔐 Message supprimé.`,
         { parse_mode: 'Markdown' }
       );
+      return _sendWalletsMenu(chatId, userId);
     } catch (err) {
       _state.delete(userId);
-      bot.sendMessage(chatId, `❌ Import échoué: ${err.message}`);
+      return bot.sendMessage(chatId, `❌ Import failed: ${err.message}`);
     }
-  } else if (state.step === 'buy_custom_amount') {
+  }
+
+  if (state.step === 'wallet_rename_label') {
+    const { walletId } = state.data;
+    wallet.renameWallet(userId, walletId, text);
+    _state.delete(userId);
+    await bot.sendMessage(chatId, `✅ Wallet renommé.`);
+    return _sendWalletsMenu(chatId, userId);
+  }
+
+  if (state.step === 'buy_custom_amount') {
     const amount = parseFloat(text);
     if (isNaN(amount) || amount <= 0) {
-      return bot.sendMessage(chatId, '⚠️ Montant invalide. Essaie encore (ex: 0.15)');
+      return bot.sendMessage(chatId, '⚠️ Montant invalide. Essaie (ex: 0.15)');
     }
     const { chain, tokenAddr, walletId } = state.data;
     _state.delete(userId);
-    await _executeBuy(chatId, userId, walletId, chain, tokenAddr, amount);
+    return _executeBuy(chatId, userId, walletId, chain, tokenAddr, amount);
+  }
+
+  if (state.step === 'settings_slippage') {
+    const pct = parseFloat(text);
+    if (isNaN(pct) || pct <= 0 || pct > 30) {
+      return bot.sendMessage(chatId, '⚠️ Slippage invalide (0-30%)');
+    }
+    _getUserPrefs(userId).slippageBps = Math.round(pct * 100);
+    _state.delete(userId);
+    return bot.sendMessage(chatId, `✅ Slippage set to ${pct}%`);
   }
 }
 
