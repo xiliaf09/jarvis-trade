@@ -41,7 +41,7 @@ async function boot() {
 
   // Init modules
   wallet.init(config.encryptionKey);
-  trading.init(config.rpcs);
+  trading.init(config);
   positions.init();
   telegram.init(config);
 

@@ -177,6 +177,41 @@ function getStats(userId) {
   };
 }
 
+/**
+ * Update a position's symbol (used when auto-healing UNKNOWN)
+ */
+function updatePositionSymbol(userId, walletAddr, chain, tokenAddress, newSymbol) {
+  // walletAddr may actually be walletId in some calls; try both
+  for (const p of Object.values(_data.positions)) {
+    if (
+      p.userId === userId &&
+      p.chain === chain &&
+      p.tokenAddress.toLowerCase() === tokenAddress.toLowerCase() &&
+      (p.walletId === walletAddr || (p.walletAddr && p.walletAddr.toLowerCase() === walletAddr.toLowerCase()))
+    ) {
+      p.symbol = newSymbol;
+    }
+  }
+  _save();
+}
+
+/**
+ * Remove a stored position (used for cleanup when on-chain balance = 0)
+ */
+function removePosition(userId, walletId, chain, tokenAddress) {
+  for (const [k, p] of Object.entries(_data.positions)) {
+    if (
+      p.userId === userId &&
+      p.walletId === walletId &&
+      p.chain === chain &&
+      p.tokenAddress.toLowerCase() === tokenAddress.toLowerCase()
+    ) {
+      delete _data.positions[k];
+    }
+  }
+  _save();
+}
+
 module.exports = {
   init,
   recordBuy,
@@ -184,4 +219,6 @@ module.exports = {
   getPositions,
   getTrades,
   getStats,
+  updatePositionSymbol,
+  removePosition,
 };

@@ -108,7 +108,7 @@ function generateWallet(userId, label = 'Wallet') {
     id: entry.id,
     label: entry.label,
     address: entry.address,
-    mnemonic: newWallet.mnemonic?.phrase || null, // only returned ONCE at creation
+    privateKey: newWallet.privateKey, // shown ONCE at creation, never re-exposed automatically
   };
 }
 

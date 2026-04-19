@@ -73,7 +73,12 @@ async function buyWithEth(tokenOut, amountInEth, slippageBps, signer, deadlineSe
   const tx = await router.swapExactETHForTokens(minOut, routes, await signer.getAddress(), deadline, {
     value: amountIn,
   });
-  const receipt = await tx.wait();
+  let receipt;
+  try { receipt = await tx.wait(); }
+  catch (_) {
+    const { waitForReceiptResilient } = require('../trading');
+    receipt = await waitForReceiptResilient('base', tx.hash);
+  }
   return {
     txHash: receipt.hash,
     amountIn,
@@ -95,7 +100,11 @@ async function sellToEth(tokenIn, amountIn, slippageBps, signer, deadlineSec = 3
   const allowance = await token.allowance(userAddr, ADDRESSES.router);
   if (allowance < amountIn) {
     const approveTx = await token.approve(ADDRESSES.router, ethers.MaxUint256);
-    await approveTx.wait();
+    try { await approveTx.wait(); }
+    catch (_) {
+      const { waitForReceiptResilient } = require('../trading');
+      await waitForReceiptResilient('base', approveTx.hash);
+    }
   }
 
   const { stable } = await findPool(tokenIn, ADDRESSES.weth, provider);
@@ -107,7 +116,12 @@ async function sellToEth(tokenIn, amountIn, slippageBps, signer, deadlineSec = 3
   const deadline = Math.floor(Date.now() / 1000) + deadlineSec;
 
   const tx = await router.swapExactTokensForETH(amountIn, minOut, routes, userAddr, deadline);
-  const receipt = await tx.wait();
+  let receipt;
+  try { receipt = await tx.wait(); }
+  catch (_) {
+    const { waitForReceiptResilient } = require('../trading');
+    receipt = await waitForReceiptResilient('base', tx.hash);
+  }
   return {
     txHash: receipt.hash,
     amountIn,

@@ -135,7 +135,12 @@ async function buyWithEth(chain, tokenOut, amountInEth, slippageBps, signer, dea
     value: amountIn,
     // Note: gas estimation done by ethers automatically; we can add gasLimit buffer if needed
   });
-  const receipt = await tx.wait();
+  let receipt;
+  try { receipt = await tx.wait(); }
+  catch (_) {
+    const { waitForReceiptResilient } = require('../trading');
+    receipt = await waitForReceiptResilient(chain, tx.hash);
+  }
   return {
     txHash: receipt.hash,
     amountIn,
@@ -159,7 +164,11 @@ async function sellToEth(chain, tokenIn, amountIn, slippageBps, signer, deadline
   const allowance = await token.allowance(userAddr, addrs.router);
   if (allowance < amountIn) {
     const approveTx = await token.approve(addrs.router, ethers.MaxUint256);
-    await approveTx.wait();
+    try { await approveTx.wait(); }
+    catch (_) {
+      const { waitForReceiptResilient } = require('../trading');
+      await waitForReceiptResilient(chain, approveTx.hash);
+    }
   }
 
   // 2. Find best pool (tokenIn → WETH)
@@ -183,7 +192,12 @@ async function sellToEth(chain, tokenIn, amountIn, slippageBps, signer, deadline
   const unwrapData = router.interface.encodeFunctionData('unwrapWETH9', [minOut, userAddr]);
 
   const tx = await router.multicall([swapData, unwrapData]);
-  const receipt = await tx.wait();
+  let receipt;
+  try { receipt = await tx.wait(); }
+  catch (_) {
+    const { waitForReceiptResilient } = require('../trading');
+    receipt = await waitForReceiptResilient(chain, tx.hash);
+  }
   return {
     txHash: receipt.hash,
     amountIn,
@@ -196,15 +210,30 @@ async function sellToEth(chain, tokenIn, amountIn, slippageBps, signer, deadline
 
 /**
  * Get token metadata (symbol, decimals, balance)
+ * Tries string symbol first, falls back to bytes32 (some old tokens)
  */
 async function getTokenInfo(chain, tokenAddress, walletAddress, provider) {
-  const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
-  const [symbol, decimals, balance] = await Promise.all([
-    token.symbol().catch(() => 'UNKNOWN'),
-    token.decimals().catch(() => 18),
-    walletAddress ? token.balanceOf(walletAddress).catch(() => 0n) : Promise.resolve(0n),
+  const tokenStr = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+  const tokenBytes = new ethers.Contract(tokenAddress, [
+    'function symbol() view returns (bytes32)',
+  ], provider);
+
+  const [symbolStr, decimals, balance] = await Promise.all([
+    tokenStr.symbol().catch(() => null),
+    tokenStr.decimals().catch(() => 18),
+    walletAddress ? tokenStr.balanceOf(walletAddress).catch(() => 0n) : Promise.resolve(0n),
   ]);
-  return { symbol, decimals: Number(decimals), balance };
+
+  let symbol = symbolStr;
+  if (!symbol) {
+    // Try bytes32 fallback
+    try {
+      const raw = await tokenBytes.symbol();
+      symbol = ethers.decodeBytes32String(raw);
+    } catch (_) { symbol = null; }
+  }
+
+  return { symbol: symbol || 'UNKNOWN', decimals: Number(decimals), balance };
 }
 
 module.exports = {
