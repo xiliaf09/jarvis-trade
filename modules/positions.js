@@ -22,6 +22,16 @@ let _data = {
 };
 
 function _load() {
+  // Seed from env var if file absent (Railway/cloud bootstrap)
+  if (!fs.existsSync(DATA_PATH) && process.env.DATA_JSON_B64) {
+    try {
+      const content = Buffer.from(process.env.DATA_JSON_B64, 'base64').toString('utf-8');
+      fs.writeFileSync(DATA_PATH, content);
+      console.log('🌱 data.json seeded from DATA_JSON_B64 env var');
+    } catch (err) {
+      console.error('⚠️  Failed to seed data.json from env:', err.message);
+    }
+  }
   if (!fs.existsSync(DATA_PATH)) return;
   try {
     _data = JSON.parse(fs.readFileSync(DATA_PATH, 'utf-8'));

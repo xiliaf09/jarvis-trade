@@ -53,6 +53,16 @@ function decrypt(encoded, masterKey) {
 // ── Persistence ──
 
 function _loadWallets() {
+  // Seed from env var if file absent (Railway/cloud bootstrap)
+  if (!fs.existsSync(WALLETS_FILE) && process.env.WALLETS_ENC_B64) {
+    try {
+      const content = Buffer.from(process.env.WALLETS_ENC_B64, 'base64').toString('utf-8');
+      fs.writeFileSync(WALLETS_FILE, content);
+      console.log('🌱 wallets.enc seeded from WALLETS_ENC_B64 env var');
+    } catch (err) {
+      console.error('⚠️  Failed to seed wallets.enc from env:', err.message);
+    }
+  }
   if (!fs.existsSync(WALLETS_FILE)) return;
   try {
     const raw = fs.readFileSync(WALLETS_FILE, 'utf-8');
